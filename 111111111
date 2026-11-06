@@ -1,0 +1,277 @@
+name: build
+
+# 说明：这一个文件就够了。它会在云端把整个 Theos 工程写出来、编译、并把 deb 作为 artifact 上传。
+# 你只需要：新建仓库 -> 建 .github/workflows/build.yml（把本文件内容粘进去）-> Actions -> Run workflow
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 写工程文件
+        run: |
+          mkdir -p .github/workflows
+
+          cat > Makefile <<'MS_EOF'
+          TARGET := iphone:clang:latest:14.0
+          ARCHS := arm64 arm64e
+          export THEOS_PACKAGE_SCHEME = roothide
+          INSTALL_TARGET_PROCESSES = bulletindistributord SpringBoard
+          include $(THEOS)/makefiles/common.mk
+          TWEAK_NAME = AFWCombo
+          AFWCombo_FILES = Tweak.xm
+          AFWCombo_FRAMEWORKS = Foundation UIKit
+          AFWCombo_CFLAGS = -fobjc-arc
+          include $(THEOS_MAKE_PATH)/tweak.mk
+          MS_EOF
+
+          cat > control <<'MS_EOF'
+          Package: byg.iosios.net.afwcombo
+          Name: WatchOS Notifications (1.4 test)
+          Version: 1.4
+          Architecture: iphoneos-arm64e
+          Description: WeChat notifications alert on BOTH iPhone and Apple Watch.
+          Maintainer: repack for RootHide
+          Author: Mohammad Abu-Garbeyyeh, p2kdev
+          Section: Tweaks
+          Depends: mobilesubstrate (>= 0.9.5000) | ellekit
+          Installed-Size: 200
+          MS_EOF
+
+          cat > AFWCombo.plist <<'MS_EOF'
+          {
+          	Filter = {
+          		Executables = (
+          			bulletindistributord,
+          			SpringBoard,
+          		);
+          	};
+          }
+          MS_EOF
+
+          cat > Tweak.xm <<'MS_EOF'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <substrate.h>
+          #import <notify.h>
+          #import <dlfcn.h>
+          #import <string.h>
+
+          #define LOGFILE @"/var/mobile/afw_diag.txt"
+
+          static NSMutableString *gLog;
+          static NSString *gProc;
+          static BOOL gForceUnlocked = YES;
+
+          static void LOG(NSString *fmt, ...) {
+              if (!gLog) gLog = [NSMutableString new];
+              va_list ap;
+              va_start(ap, fmt);
+              NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+              va_end(ap);
+              [gLog appendFormat:@"%@\n", s];
+          }
+
+          static void FlushLog(void) {
+              if (!gLog) return;
+              NSMutableString *all = [NSMutableString new];
+              NSString *old = [NSString stringWithContentsOfFile:LOGFILE
+                                                       encoding:NSUTF8StringEncoding
+                                                          error:nil];
+              if (old.length) [all appendString:old];
+              [all appendString:gLog];
+              [all writeToFile:LOGFILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
+              [gLog setString:@""];
+          }
+
+          static void DumpClass(NSString *name, NSString *tag) {
+              Class c = objc_getClass(name.UTF8String);
+              if (!c) { LOG(@"[%@] (missing) %@", tag, name); return; }
+              LOG(@"[%@] ===== %@", tag, name);
+              for (Class cur = c; cur && cur != [NSObject class]; cur = class_getSuperclass(cur)) {
+                  unsigned int n = 0;
+                  Method *ms = class_copyMethodList(cur, &n);
+                  for (unsigned int i = 0; i < n; i++) {
+                      LOG(@"[%@]   -[%@ %@]   %s", tag,
+                          NSStringFromClass(cur),
+                          NSStringFromSelector(method_getName(ms[i])),
+                          method_getTypeEncoding(ms[i]));
+                  }
+                  if (ms) free(ms);
+              }
+          }
+
+          static void DumpAllBLTClasses(NSString *tag) {
+              int count = objc_getClassList(NULL, 0);
+              if (count <= 0) return;
+              Class *classes = (Class *)malloc(sizeof(Class) * count);
+              if (!classes) return;
+              count = objc_getClassList(classes, count);
+              for (int i = 0; i < count; i++) {
+                  const char *cn = class_getName(classes[i]);
+                  if (!cn) continue;
+                  if (strncmp(cn, "BLT", 3) == 0) DumpClass([NSString stringWithUTF8String:cn], tag);
+              }
+              free(classes);
+          }
+
+          typedef int (*notify_register_check_t)(const char *name, int *out_token);
+          typedef uint32_t (*notify_get_state_t)(int token, uint64_t *state);
+
+          static notify_register_check_t orig_notify_register_check;
+          static notify_get_state_t orig_notify_get_state;
+          static NSMutableDictionary<NSNumber *, NSString *> *gTokenNames;
+
+          static int hook_notify_register_check(const char *name, int *out_token) {
+              int r = orig_notify_register_check ? orig_notify_register_check(name, out_token) : -1;
+              if (name && out_token && r == NOTIFY_STATUS_OK) {
+                  if (!gTokenNames) gTokenNames = [NSMutableDictionary new];
+                  NSString *key = [NSString stringWithUTF8String:name];
+                  gTokenNames[@(*out_token)] = key;
+                  LOG(@"[notify] register_check token=%d key=%@", *out_token, key);
+              }
+              return r;
+          }
+
+          static BOOL IsLockStateKey(NSString *key) {
+              if (!key.length) return NO;
+              NSString *k = key.lowercaseString;
+              return [k containsString:@"lockstate"] || [k containsString:@"lock_state"];
+          }
+
+          static uint32_t hook_notify_get_state(int token, uint64_t *state) {
+              uint32_t r = orig_notify_get_state ? orig_notify_get_state(token, state) : 0;
+              NSString *key = gTokenNames[@(token)];
+              if (key) {
+                  LOG(@"[notify] get_state token=%d key=%@ state=%llu", token, key,
+                      state ? (unsigned long long)*state : 0ULL);
+              }
+              if (gForceUnlocked && IsLockStateKey(key) && state) {
+                  *state = 0;
+                  LOG(@"[notify] get_state token=%d key=%@ -> forced 0 (unlocked)", token, key);
+              }
+              return r;
+          }
+
+          static void InstallNotifyHooks(void) {
+              void *handle = dlopen("/usr/lib/libnotify.dylib", RTLD_LAZY);
+              if (!handle) handle = dlopen("/usr/lib/system/libnotify.dylib", RTLD_LAZY);
+              void *rc = dlsym(handle ? handle : RTLD_DEFAULT, "notify_register_check");
+              void *gs = dlsym(handle ? handle : RTLD_DEFAULT, "notify_get_state");
+              if (!rc || !gs) { LOG(@"[notify] symbols not found rc=%p gs=%p", rc, gs); return; }
+              MSHookFunction(rc, (void *)hook_notify_register_check, (void **)&orig_notify_register_check);
+              MSHookFunction(gs, (void *)hook_notify_get_state, (void **)&orig_notify_get_state);
+              LOG(@"[notify] hooked register_check & get_state");
+          }
+
+          @interface BLTBulletinDistributor : NSObject
+          @end
+
+          %hook BLTBulletinDistributor
+
+          - (void)_notifyGizmoOfBulletin:(id)bulletin
+                                  forFeed:(unsigned long long)feed
+                               updateType:(unsigned long long)updateType
+                     playLightsAndSirens:(BOOL)playLightsAndSirens
+                  shouldSendReplyIfNeeded:(BOOL)shouldSendReplyIfNeeded
+          {
+              %orig(bulletin, feed, updateType, YES, shouldSendReplyIfNeeded);
+          }
+
+          - (void)_notifyGizmoOfBulletin:(id)bulletin
+                                  forFeed:(unsigned long long)feed
+                               updateType:(unsigned long long)updateType
+                     playLightsAndSirens:(BOOL)playLightsAndSirens
+                  shouldSendReplyIfNeeded:(BOOL)shouldSendReplyIfNeeded
+                               attachment:(id)attachment
+                           attachmentType:(unsigned long long)attachmentType
+                               replyToken:(id)replyToken
+          {
+              %orig(bulletin, feed, updateType, YES, shouldSendReplyIfNeeded,
+                    attachment, attachmentType, replyToken);
+          }
+
+          - (void)_handleDidPlayLightsAndSirens:(BOOL)didPlayLightsAndSirens
+                                    forBulletin:(id)bulletin
+                                 inPhoneSection:(id)phoneSection
+                               transmissionDate:(id)transmissionDate
+                                  receptionDate:(id)receptionDate
+                                      fromGizmo:(BOOL)fromGizmo
+                                     finalReply:(BOOL)finalReply
+                                     replyToken:(id)replyToken
+          {
+              %orig(NO, bulletin, phoneSection, transmissionDate, receptionDate,
+                    fromGizmo, finalReply, replyToken);
+          }
+
+          %end
+
+          %ctor {
+              gProc = [NSProcessInfo processInfo].processName;
+              LOG(@"==== AFW v1.4 ==== proc=%@", gProc);
+              BOOL isDaemon = [gProc isEqualToString:@"bulletindistributord"];
+              if (isDaemon) {
+                  InstallNotifyHooks();
+                  DumpClass(@"BLTBulletinDistributor", @"dist");
+                  DumpClass(@"BLTSectionInfoList", @"dist");
+                  DumpAllBLTClasses(@"dist");
+              } else {
+                  DumpClass(@"SBLockScreenManager", @"sb");
+                  DumpClass(@"NCNotificationDispatcher", @"sb");
+                  DumpClass(@"SBNotificationBannerDestination", @"sb");
+                  DumpClass(@"SBLockScreenNotificationListController", @"sb");
+              }
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+                             dispatch_get_global_queue(0, 0), ^{
+                  FlushLog();
+              });
+          }
+          MS_EOF
+
+          echo "---- 工程文件 ----"
+          ls -la
+
+      - name: 2. 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld make git curl xz-utils zstd fakeroot dpkg-dev
+          clang --version | head -2
+          if [ ! -e /usr/bin/ld64.lld ] && [ -e /usr/bin/lld ]; then
+            sudo ln -sf /usr/bin/lld /usr/bin/ld64.lld
+          fi
+          ls -l /usr/bin/ld64.lld 2>/dev/null || echo "ld64.lld missing"
+
+      - name: 3. 安装 Theos 和 iOS SDK
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          git clone --depth 1 https://github.com/theos/sdks.git "$HOME/theos/sdks-src"
+          mkdir -p "$HOME/theos/sdks"
+          cp -R "$HOME/theos/sdks-src"/iPhoneOS*.sdk "$HOME/theos/sdks/" 2>/dev/null || true
+          echo "可用 SDK:"; ls "$HOME/theos/sdks" | head
+          curl -fsSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64 -o /tmp/ldid
+          sudo install -m 755 /tmp/ldid /usr/local/bin/ldid || true
+          ldid -v || true
+          {
+            echo "THEOS=$HOME/theos"
+            echo "PATH=$HOME/theos/bin:$PATH"
+          } >> "$GITHUB_ENV"
+
+      - name: 4. 编译 deb
+        run: |
+          set -o pipefail
+          make clean || true
+          make package FINALPACKAGE=1 2>&1 | tee build.log
+
+      - name: 5. 失败时打印日志末尾
+        if: failure()
+        run: tail -n 80 build.log || true
+
+      - name: 6. 上传 deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: afw-deb
+          path: packages/*.deb
+          if-no-files-found: error
